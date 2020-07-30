@@ -11,3 +11,8 @@ Objectives
 7. Internall logging capability at full acquisition rate for at least 30s duration
 8. logged file retrieval to be over wireless link &/or to removable SD card
 
+Useful references
+
+https://www.ti.com/product/ADS131M04
+
+https://www.ti.com/lit/ug/sbau332a/sbau332a.pdf
