@@ -1,0 +1,4 @@
+Tx_freq, 145.000
+Rx_freq, 145.000
+Filter, 010
+APRS_packet, _Position_Time
