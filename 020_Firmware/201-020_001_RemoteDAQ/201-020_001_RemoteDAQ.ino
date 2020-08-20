@@ -11,11 +11,19 @@
 #include <WiFi.h>
 #include "Microchip_PAC193x.h"
 #include <Wire.h>
-// includes relating to APRS and packet radio
+
+#include "ads131m0x.h"
+#include "hal.h"
 
 // #defines
 
 #define hw_ver            1
+
+//-------------------------------------
+// DAQ State machine states
+#define st_daq_initial    10
+#define st_daq_check_status 20
+#define st_daq_standby      30
 
 //-------------------------------------
 // fileLogger states
@@ -32,30 +40,22 @@ int logState, nextLogState;
 
 //--------------------------------------
 // Define I/O
-/* RocTrak(ino) rev0.1
-  Designed to work with board 200_010_010-001_RocTrak rev0.1
-  A few issues have been discovered with the board to date, 
-  requiring some mods and use of pins differently to originially
-  intended.
-  - Radio PTT was not connected to the ESP32 - need to use Ch4output to pull PTT low 
-  - VMon analog inputs not usable with WiFi activated - Did not read this until
-    too late ie that when WiFi module is enabled, ADC2 is not reliable. Voltage monitoring
-    will need to be performed using SmartBatteryIsolator and I2C interface
-  - DTMF ArmStatus LED was connected to pin GPI36, which unfortunately is 1 of only 4 pins that can be an input only.
-    Will connect this to one of the VMon pins instead, VMon3 
+/* RemoteDAQ rev0.1
+  Designed to work with board 201_010_010-001_RemoteDaq rev0.1
+  
 */
 //-----------------------------------------------------------
 // Pin definitions going around the board 
 
-    #define RX1Pin      36  // Connected to GPS Tx 
-    #define DTMF_ValidPin 39
-    #define DTMF_D3Pin  34
-    #define DTMF_D2Pin  35
-    #define DTMF_D1Pin  32
-    #define DTMF_D0Pin  33
-    #define TonePin     25   // audio tone out to radio for APRS or similar
-    #define Tone2Pin    26   // 2nd/alternative audio tone out pin
-    #define ToneInPin   27   // Analog input for audio signals
+    //#define SPARE       36  // Connected to GPS Tx 
+    //#define SPARE   39
+    //#define SPARE   34
+    //#define SPARE_  35
+    #define STATUS1   32
+    #define STATUS2   33
+    #define STATUS3   25   
+    //#define SPARE    26
+    #define Cont4Pin    27   // output ch4 continuity measurement
     #define Cont3Pin    14   // output ch3 continuity measurement
     #define Cont2Pin    12   // output ch2 continuity measurement
     #define Cont1Pin    13   // output ch1 continuity measurement
@@ -63,16 +63,14 @@ int logState, nextLogState;
     #define GOut3Pin    2  // output ch3 FET gate drive
     #define GOut2Pin    0  // output ch2 FET gate drive
     #define GOut1Pin    4   // output ch1 FET gate drive
-    #define RX2Pin      16 // RX2, Connects to radio Uart Tx
-    #define TX2Pin      17 // TX2, Connects to radio Uart Rx
-    #define DTMF_ArmStatusPin 5 // was VMON input
-    #define PTT4Pin     18   // PTT gate drive
-    #define TX1Pin      19    // Connected to GPS Rx
+    #define ADC_SYNC    16 // 
+    #define ADC_DRDY    17 // 
+    #define ADC_CS      5 // 
+    #define ADC_SCK     18   // 
+    #define ADC_MISO    19    //
     #define SDAPin      21
     #define SCLPin      22
-    #define BuzzDrivePin 23 // Drives buzzer via Nch FET
-
-
+    #define ADC_MOSI    23 // 
 
 // forward declarations
 
@@ -111,8 +109,6 @@ Command cmdSystemStatus;
 Command cmdOutputDrive;
 Command cmdPowerMon;
 //----------------------------------------------------------------------------
-
-Microchip_PAC193x PAC(10000,10000,10000,10000,4) ;  // PAC1934 power monitor, construct with new resistor value of 10000 uOhm
 
 int value;
 
@@ -188,14 +184,15 @@ if (digitalRead(Cont1Pin)==LOW) {
   else {
     sCont3 = "OC";
     Cont3=0;
-  }/*if (digitalRead(Cont4Pin)==LOW) {
+  }
+  if (digitalRead(Cont4Pin)==LOW) {
     sCont4 = "CC";
     Cont4 = 1;
   }
   else {
     sCont4 = "OC";
     Cont4=0;
-  } */
+  } 
 }
   
 void updateOutputs(void){
@@ -219,18 +216,13 @@ void setup() {
   pinMode(GOut1Pin, OUTPUT);
   pinMode(GOut2Pin, OUTPUT);
   pinMode(GOut3Pin, OUTPUT);
-  pinMode(PTT4Pin, OUTPUT);
+  pinMode(GOut4Pin, OUTPUT);
   pinMode(Cont1Pin, INPUT_PULLUP);
   pinMode(Cont2Pin, INPUT_PULLUP);
   pinMode(Cont3Pin, INPUT_PULLUP);
   pinMode(Cont4Pin, INPUT_PULLUP);
   
 
-  // Others
-  pinMode(BuzzDrivePin, OUTPUT);
-  pinMode(TonePin, OUTPUT);
-  pinMode(RX1Pin, INPUT);
-  
   // Serial ports  
   Serial.begin(115200);     // Default port with USB converter
   
@@ -246,7 +238,7 @@ void setup() {
   // Define tasks
   TaskHandle_t TaskH_WebServer;
   TaskHandle_t TaskH_FileLogger;
-
+  TaskHandle_t TaskH_DAQ;
     
   //----------------------------------------------------------------------------------------------------------
   // Setup and creation of tasks
@@ -272,6 +264,17 @@ void setup() {
                     7,           // priority of the task 
                     &TaskH_FileLogger,  // Task handle to keep track of created task 
                     0);          // pin task to core 0 
+  delay(500); 
+
+  //create DAQ task that will be executed in the Task_DAQ() function, with priority 5 and executed on core 1
+  xTaskCreatePinnedToCore(
+                    Task_DAQ, // Task function. 
+                    "DAQ",  // name of task. 
+                    10000,       // Stack size of task 
+                    NULL,        // parameter of the task 
+                    5,           // priority of the task 
+                    &TaskH_DAQ,  // Task handle to keep track of created task 
+                    1);          // pin task to core 0 
   delay(500); 
 
   // Turn on interrupts
@@ -347,6 +350,31 @@ void loop() {
 // ISRs
 //
 //---------------------------------------------------------------------------
+
+  //---------------------------------------------------------------------------
+  // DAQ task setup to run on it's own core so as to be free from interruption
+  //---------------------------------------------------------------------------
+  void Task_DAQ( void * parameter)
+  {
+  unsigned int daqState;
+
+  daqstate = st_daq_initial;
+  
+  for(;;){
+    // Implementation of state machine used to operate DAQ system
+    switch (daqState) {
+
+      case st_daq_initial :
+          
+                        
+          }
+      break;
+
+    delayMicroseconds(1);
+  }
+
+  
+  }
   //---------------------------------------------------------------------------
   // 
   //---------------------------------------------------------------------------
